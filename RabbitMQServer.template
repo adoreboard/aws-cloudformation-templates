@@ -1,0 +1,383 @@
+{
+    "AWSTemplateFormatVersion": "2010-09-09",
+
+    "Description": "RabbitMQ Server (Ubuntu)",
+
+    "Parameters": {
+
+        "KeyName": {
+            "Description": "The name of an existing key pair to enable SSH access to Amazon EC2 instances",
+            "Type": "String",
+            "MinLength": "1",
+            "MaxLength": "255",
+            "AllowedPattern": "[\\x20-\\x7E]*",
+            "ConstraintDescription": "KeyPair name from 1 to 255 ASCII characters.",
+            "Default": ""
+        },
+
+        "InstanceType": {
+            "Description": "RabbitMQ Node Type (EC2 Instance)",
+            "Type": "String",
+            "Default": "m3.medium",
+            "AllowedValues": [
+                "m3.medium",
+                "m3.large",
+                "r3.large"
+            ],
+            "ConstraintDescription": "Must be a valid Amazon EC2 instance type."
+        },
+
+        "RabbitMQClusterName" : {
+            "Description" : "Name of the RabbitMQ server set e.g. rmq",
+            "Type" : "String",
+            "Default" : "rmq"
+        },
+
+        "RabbitMQClusterNumber" : {
+            "Description" : "Number of server in RabbitMQ cluster (used with RabbitMQClusterName)",
+            "Type" : "String",
+            "AllowedValues" : ["1","2","3"],
+            "Default" : "1"
+        },
+
+        "VpcId": {
+            "Description": "The VPC of the cluster",
+            "Type" : "AWS::EC2::VPC::Id",
+            "Default": ""
+        },
+
+        "SubnetId": {
+            "Description": "The subnet of the cluster",
+            "Type" : "AWS::EC2::Subnet::Id",            
+            "Default": ""
+        },
+        
+        "SecurityGroupId": {
+            "Description": "The security group for the shards",
+            "Type": "AWS::EC2::SecurityGroup::Id",
+            "Default": ""
+        },
+
+        "UpdateRoute53": {
+            "Description": "Add record set to AWS Route53 service.  Note: don't select this option if you want to update the Route53 table separately",
+            "Type": "String",
+            "Default": "True",
+            "AllowedValues": [ "True", "False" ]
+        },
+
+        "Route53HostedZone": {
+            "Description": "Route 53 hosted zone for updating internal DNS (Only applicable if the parameter [ UpdateRoute53 ] = \"true\"",
+            "Type": "AWS::Route53::HostedZone::Id",
+            "Default": ""
+        },
+
+        "VolumeSize" : {
+            "Description" : "Volume size for the root volume (default 100)",
+            "Type" : "Number",
+            "Default" : "100"
+        }
+    },
+    "Mappings": {
+        "AWSInstanceType2Arch": {
+            "m3.medium": {"Arch": "64"},
+            "m3.large": { "Arch" : "64" },
+            "r3.large" : { "Arch" : "64HVM"}
+        },
+        "AWSRegionArch2AMI": {
+            "eu-west-1" : { "64" : "ami-5da23a2a", "64HVM" : "ami-47a23a30" },
+            "us-east-1" : { "64" : "ami-d85e75b0", "64HVM" : "ami-d05e75b8" },
+            "us-west-1" : { "64" : "ami-d16a8b95", "64HVM" : "ami-df6a8b9b" }
+        }
+    },
+
+    "Resources": {
+
+        "RabbitMQServer": {
+            "Type": "AWS::EC2::Instance",
+            "Metadata": {
+                "AWS::CloudFormation::Init": {
+
+                    "Comment1" : "This creates an instance and installs RabbitMQ, Monitoring and Route53",
+
+                    "configSets" : {
+                        "Install" : [ "Update-Route53", "Metric-Uploading-Config", "Install-RabbitMQ"]
+                    },
+
+                    "Update-Route53" : {
+                        "files" : {
+                            "/usr/local/bin/cli53" : {
+                                "source" : "https://github.com/barnybug/cli53/releases/download/0.6.3/cli53-linux-amd64",
+                                "mode" : "000755",
+                                "owner" : "root",
+                                "group" : "root"
+                            },
+                            "/tmp/update_route53.sh" : {
+                                "content" : { "Fn::Join" : ["", [
+                                    "#!/bin/bash\n\n",
+                                    "PRIVATE_IP=`curl http://169.254.169.254/latest/meta-data/local-ipv4/`\n",
+                                    "UPDATE_ROUTE_53=",  {"Ref": "UpdateRoute53" }, "\n",
+                                    "if [ $UPDATE_ROUTE_53 == 'True' ] ; then \n",
+                                    "  /usr/local/bin/cli53 rrcreate ",  {"Ref": "Route53HostedZone" }, 
+                                    " \"" , { "Ref" : "RabbitMQClusterName" }, "-", { "Ref" : "RabbitMQClusterNumber" }, " 300 A $PRIVATE_IP\" --replace --wait ; \n",
+                                    "fi\n",
+                                    "echo Route53 Update Finished!"
+                                ] ] },
+                                "mode" : "000755",
+                                "owner" : "root",
+                                "group" : "root"
+                            }
+                        },
+                        "commands" : {
+                            "01_UpdateRoute53" : {
+                                "command" : "/tmp/update_route53.sh > /tmp/update_route53.log 2>&1"
+                            }
+                        }
+                    },     
+
+                    "Metric-Uploading-Config" : {
+                        "packages" : {
+                            "apt" : {
+                                "unzip" : [],
+                                "libwww-perl" : [],
+                                "libdatetime-perl" : []
+                            }
+                        },
+
+                        "sources" : {
+                            "/home/ubuntu" : "http://aws-cloudwatch.s3.amazonaws.com/downloads/CloudWatchMonitoringScripts-1.2.1.zip"
+                        },
+
+                        "files" : {
+                            "/home/ubuntu/crontab": {
+                                "content" : "*/1 * * * * ~/aws-scripts-mon/mon-put-instance-data.pl --aws-iam-role=MonitorRole --mem-used --memory-units=megabytes --mem-util --disk-space-util --disk-space-used --disk-space-avail --disk-path=/ \n",
+                                "mode" : "000600",
+                                "owner" : "ubuntu",
+                                "group" : "ubuntu"
+                            } 
+                        },
+
+                        "commands" : {
+                            "01_AptGetUpdateMonitoring" : {
+                                "command" : "apt-get update -y"
+                            },
+                            "02_MonitoringCron" : {
+                                "command" : "chmod +x /home/ubuntu/aws-scripts-mon/*.pl && crontab -u ubuntu /home/ubuntu/crontab && rm /home/ubuntu/crontab"
+                            }
+                        }
+                    },
+
+                    "Install-RabbitMQ" : {
+                        "packages" : {
+                            "apt" : {
+                                "awscli" : [],
+                                "jq" : []
+                            }
+                        },
+                        "files" : {
+                            "/tmp/config-rabbitmq.sh" : {
+                                "content" : { "Fn::Join" : ["", [
+                                    "#!/bin/bash\n\n",
+
+                                    "echo RabbitMQ Configuration\n\n",
+
+                                    "# Configure rabbitmq injects in zone name.  ",
+                                    "# NOTE: In Ubuntu we're using the more powerful'jq' instead of the 'jp' (which comes with Amazon Linux) - see https://stedolan.github.io/jq/ for more details.\n",
+
+                                    "ZONE_NAME=`aws route53 get-hosted-zone --id ", {"Ref": "Route53HostedZone" }, " | jq '.HostedZone.Name' | sed 's/\"//g' | sed 's/\\.$//' `\n",
+                                    "SERVER_NAME=", {"Ref" : "RabbitMQClusterName"}, "-", {"Ref" : "RabbitMQClusterNumber"}, "\n",
+                                    "FQ_SERVER_NAME=$SERVER_NAME.$ZONE_NAME\n",
+
+                                    "echo \"1. [ FQ_SERVER_NAME ] = $FQ_SERVER_NAME\"\n\n",
+
+                                    "echo \"2. New entry  [ /etc/hosts ]\"\n",
+                                    "echo -e \"127.0.0.1 $FQ_SERVER_NAME $SERVER_NAME\n$(cat /etc/hosts)\" > /etc/hosts\n\n", 
+
+                                    "echo \"3. Generating [ /etc/hostname ]\"\n",
+                                    "echo $SERVER_NAME > /etc/hostname\n",
+                                    "hostname -F /etc/hostname\n",
+
+                                    "echo \"4. Generating [ /etc/rabbitmq/rabbitmq-env.conf ]\"\n",
+                                    "mkdir /etc/rabbitmq\n",
+                                    "echo NODE_PORT=5672 > /etc/rabbitmq/rabbitmq-env.conf\n\n",
+
+                                    "echo \"5. Generating [ /etc/rabbitmq/rabbitmqadmin.conf ]\"\n",
+                                    "echo \"[default]\nport = 15672\" > /etc/rabbitmq/rabbitmqadmin.conf\n\n"
+
+                                ] ] },
+                                "mode" : "000755",
+                                "owner" : "root",
+                                "group" : "root"
+                            },
+                            "/tmp/install-rabbitmq.sh" : {
+                                "content" : { "Fn::Join" : ["", [
+                                    "#!/bin/sh\n",
+
+                                    "RABBITMQ_CLUSTER_NUMBER=", {"Ref" : "RabbitMQClusterNumber"}, "\n",
+                                    "RABBITMQ_CLUSTER_NAME=", {"Ref" : "RabbitMQClusterName"}, "\n\n",
+
+                                    "echo \"1. Installing RabbitMQ\"\n",
+                                    "cat <<EOF > /etc/apt/sources.list.d/rabbitmq.list\n",
+                                    "deb http://www.rabbitmq.com/debian/ testing main\n",
+                                    "EOF\n\n",
+
+                                    "curl https://www.rabbitmq.com/rabbitmq-signing-key-public.asc -o /tmp/rabbitmq-signing-key-public.asc\n",
+                                    "apt-key add /tmp/rabbitmq-signing-key-public.asc\n",
+                                    "rm /tmp/rabbitmq-signing-key-public.asc\n\n",
+
+                                    "apt-get -qy update\n",
+                                    "apt-get -qy install rabbitmq-server\n\n",
+
+                                    "echo \"2. Installing management plugin\"\n",
+                                    "rabbitmq-plugins enable rabbitmq_management\n\n",
+
+                                    "echo \"3. Generate [ /var/lib/rabbitmq/.erlang.cookie ]\"\n",
+                                    "echo -n \"rabbitmq_erlang_cookie_", { "Ref" : "RabbitMQClusterName" }, "\" > /var/lib/rabbitmq/.erlang.cookie\n\n",
+
+                                    "echo \"4. Stopping RabbitMQ (by killing epmd / erl processes).\"\n",
+                                    "# NOTE: We're killing because there are issues around stopping manually - we could possibly improve the following 2 lines in the future [Bob Marks]\n",
+                                    "ps aux | grep -ie erl | awk '{print $2}' | xargs kill -9\n",
+                                    "ps aux | grep -ie epmd | awk '{print $2}' | xargs kill -9\n\n",
+                                    
+                                    "echo \"5. Starting RabbitMQ and also resetting nodes.\"\n",
+                                    "/etc/init.d/rabbitmq-server start\n",
+                                    "rabbitmqctl stop_app\n",
+                                    "rabbitmqctl reset\n\n",
+
+                                    "echo \"6. Add node if not we are not cluster 1 .\"\n",
+                                    "# NOTE: we are assuming that server 1 is the master.\n",
+                                    "if [ $RABBITMQ_CLUSTER_NUMBER != 1 ] ; then ",
+                                    "  rabbitmqctl join_cluster rabbit@${RABBITMQ_CLUSTER_NAME}-1\n",
+                                    "  echo \"This Node [ rabbit@${RABBITMQ_CLUSTER_NAME}-${RABBITMQ_CLUSTER_NUMBER} ] has been added to [ rabbit@${RABBITMQ_CLUSTER_NAME}-1 ]\"\n",
+                                    "fi\n\n",
+                                    
+                                    "echo \"7. Restarting RabbitMQ with cluster setup.\"\n",
+                                    "rabbitmqctl start_app\n\n",
+
+                                    "echo \"8. Setup [ admin ] user\"\n",
+                                    "rabbitmqctl add_user admin admin\n",
+                                    "rabbitmqctl set_permissions -p / admin \".*\" \".*\" \".*\"\n",
+                                    "rabbitmqctl set_user_tags admin administrator\n\n",
+
+                                    "echo \"9. Done!\"\n"
+
+                                ] ] },
+                                "mode" : "000755",
+                                "owner" : "root",
+                                "group" : "root"
+                            }
+                        },
+                        "commands" : {
+                            "01_ConfigureRabbitMQ" : {
+                                "command" : "/tmp/config-rabbitmq.sh > /tmp/config-rabbitmq.log 2>&1"
+                            },
+                            "02_InstallRabbitMQServer" : {
+                                "command" : "/tmp/install-rabbitmq.sh > /tmp/install-rabbitmq.log 2>&1"
+                            }
+                        }
+                    }
+                }
+            },
+            "Properties": {
+                "ImageId": {
+                    "Fn::FindInMap": [
+                        "AWSRegionArch2AMI",
+                        {
+                            "Ref": "AWS::Region"
+                        },
+                        {
+                            "Fn::FindInMap": [
+                                "AWSInstanceType2Arch",
+                                {
+                                    "Ref": "InstanceType"
+                                },
+                                "Arch"
+                            ]
+                        }
+                    ]
+                },
+                "InstanceType": {
+                    "Ref": "InstanceType"
+                },
+                "SecurityGroupIds": [
+                    {
+                        "Ref" : "SecurityGroupId"
+                    }
+                ],
+                "KeyName": {
+                    "Ref": "KeyName"
+                },
+                "SubnetId": {
+                    "Ref": "SubnetId"
+                },
+                "IamInstanceProfile": "MonitorRole",
+                "Monitoring" : "true",
+                "Tags": [
+                    {
+                        "Key": "Stack",
+                        "Value": "Production"
+                    },
+                    {
+                        "Key": "Name",
+                        "Value": { "Fn::Join" : ["", [ 
+                            "RabbitMQ-", { "Ref" : "RabbitMQClusterNumber" }
+                        ]]}
+                    }
+                ],
+                "BlockDeviceMappings" : [
+                    {
+                        "DeviceName" : "/dev/sda1",
+                        "Ebs" : { "VolumeSize" : { "Ref" : "VolumeSize" } }
+                    }
+                ],
+                "UserData": { "Fn::Base64" : { "Fn::Join" : ["", [
+                    "#!/bin/bash -xe\n",
+
+                    "apt-get update\n",
+                    "apt-get -y install python-setuptools\n",
+                    "mkdir aws-cfn-bootstrap-latest\n",
+                    "curl https://s3.amazonaws.com/cloudformation-examples/aws-cfn-bootstrap-latest.tar.gz | tar xz -C aws-cfn-bootstrap-latest --strip-components 1\n",
+                    "easy_install aws-cfn-bootstrap-latest\n",
+
+                    "## Error reporting helper function\n",
+                    "function error_exit\n",
+                    "{\n",
+                    "   /opt/aws/bin/cfn-signal --exit-code 1 --reason \"$1\" '", { "Ref" : "WaitHandleRabbitMQ" }, "'\n",
+                    "   exit 1\n",
+                    "}\n",
+
+                    "/usr/local/bin/cfn-init -v ",
+                    "         --stack ", { "Ref" : "AWS::StackName" },
+                    "         --resource RabbitMQServer ",
+                    "         --configsets Install ",
+                    "         --region ", { "Ref" : "AWS::Region" }, "\n",
+                    "     > /tmp/cfn-init.log 2>&1 || error_exit $(</tmp/cfn-init.log)\n",
+
+                    "## Resize root volumne\n",
+                    "/sbin/resize2fs /dev/xvda1\n",
+
+                    "## CloudFormation signal that setup is complete\n",
+                    "/usr/local/bin/cfn-signal ",
+                    "         --exit-code 0",
+                    "         --reason \"RabbitMQInstance setup complete\" '", { "Ref" : "WaitHandleRabbitMQ" }, "'\n"
+
+                ]]}}
+            }
+
+        },
+
+        "WaitHandleRabbitMQ" : {
+            "Type" : "AWS::CloudFormation::WaitConditionHandle",
+            "Properties" : {}
+        },
+
+        "WaitConditionRabbitMQ" : {
+            "Type" : "AWS::CloudFormation::WaitCondition",
+            "DependsOn" : "RabbitMQServer",
+            "Properties" : {
+                "Handle" : { "Ref" : "WaitHandleRabbitMQ" },
+                "Timeout" : "600"
+            }
+        }
+    }
+    
+}

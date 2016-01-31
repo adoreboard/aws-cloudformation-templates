@@ -1,0 +1,324 @@
+{
+    "AWSTemplateFormatVersion": "2010-09-09",
+
+    "Description": "MongoDB Config Server (Amazon Linux)",
+    
+    "Parameters": {
+    
+        "KeyName": {
+            "Description": "The name of an existing key pair to enable SSH access to Amazon EC2 instances",
+            "Type": "String",
+            "Default": ""
+        },
+    
+        "InstanceType": {
+            "Description": "MongoDB Node Type (EC2 Instance)",
+            "Type": "String",
+            "Default": "t2.micro",
+            "AllowedValues": [
+                "t2.micro",
+                "t2.small",
+                "t2.medium"
+            ],
+            "ConstraintDescription": "Must be a valid Amazon EC2 instance type."
+        },
+
+        "AccessKeyId" : {
+            "Description" : "Access Key ID",
+            "Type" : "String",
+            "Default" : ""
+        },
+
+        "SecretAccessKey" : {
+            "Description" : "Secret Access Key for the specified Access Key ID",
+            "Type" : "String",
+            "Default" : ""
+        },
+
+        "ConfigServerNumber" : {
+            "Description" : "Number of Mongo config server",
+            "Type" : "String",
+            "AllowedValues" : ["1","2","3"],
+            "Default" : "1"
+        },
+    
+        "MongoConfigVpcId": {
+            "Description": "The VPC of the MongoDB Config Server",
+            "Type" : "AWS::EC2::VPC::Id",
+            "Default": ""
+        },
+    
+        "MongoConfigSubnetId": {
+            "Description": "The subnet of the MongoDB Config Server",
+            "Type" : "AWS::EC2::Subnet::Id",            
+            "Default": ""
+        },
+    
+        "MongoConfigGroupId": {
+            "Description": "The security group for the MongoDB Config Server",
+            "Type": "AWS::EC2::SecurityGroup::Id",
+            "Default": ""
+        },
+
+        "UpdateRoute53": {
+            "Description": "Add record set to AWS Route53 service.  Note: don't select this option if you want to update the Route53 table separately",
+            "Type": "String",
+            "Default": "True",
+            "AllowedValues": [ "True", "False" ]
+        },
+
+        "Route53HostedZone": {
+            "Description": "Route 53 hosted zone for updating internal DNS (Only applicable if the parameter [ UpdateRoute53 ] = \"true\"",
+            "Type": "AWS::Route53::HostedZone::Id",
+            "Default": ""
+        }
+    
+    },
+    
+    "Mappings": {
+        "AWSInstanceType2Arch": {
+            "t2.micro"  : { "Arch": "64HVM" },
+            "t2.small"  : { "Arch": "64" },
+            "t2.medium" : { "Arch": "64" }
+        },
+        "AWSRegionArch2AMI": {
+            "eu-west-1" : { "64" : "ami-2918e35e", "64HVM" : "ami-4b18e33c" },
+            "us-east-1" : { "64" : "ami-fb8e9292", "64HVM" : "ami-978d91fe" },
+            "us-west-1" : { "64" : "ami-7aba833f", "64HVM" : "ami-5aba831f" }
+        }
+    },
+    
+    "Resources": {
+
+        "MongoDbConfigServer": {
+            "Type": "AWS::EC2::Instance",
+            "Metadata": {
+                "AWS::CloudFormation::Init": {
+
+                    "Comment1" : "This creates an instance (generally a micro) and installs a MongoDB config server",
+
+                    "configSets" : {
+                        "Install" : [ "Metric-Uploading-Config", "Install-MongoDB", "Update-Route53" ]
+                    },
+
+                    "Metric-Uploading-Config" : {
+                        "packages" : {
+                            "yum" : {
+                                "perl-Sys-Syslog" : [],
+                                "perl-Switch" : [],
+                                "perl-URI" : [],
+                                "perl-IO-Compress" : [],
+                                "perl-Bundle-LWP" : []
+                            }
+                        },
+                        "sources" : {
+                            "/home/ec2-user" : "http://ec2-downloads.s3.amazonaws.com/cloudwatch-samples/CloudWatchMonitoringScripts-v1.1.0.zip"
+                        },
+                        "files" : {
+                            "/home/ec2-user/crontab": {
+                                "content" : { "Fn::Join" : ["", [
+                                    "*/1 * * * * ~/aws-scripts-mon/mon-put-instance-data.pl --aws-iam-role=MonitorRole --mem-used --memory-units=megabytes --mem-util --disk-space-util --disk-space-used --disk-space-avail --disk-path=/","\n"
+                                ]]},
+                                "mode" : "000600",
+                                "owner" : "ec2-user",
+                                "group" : "ec2-user"
+                            } 
+                        },
+                        "commands" : {
+                            "01_YumUpdateMonitoring" : {
+                                "command" : "yum update -y"
+                            },
+                            "02_MonitoringCron" : {
+                                "command" : "chmod +x /home/ec2-user/aws-scripts-mon/*.pl && crontab -u ec2-user /home/ec2-user/crontab && rm /home/ec2-user/crontab"
+                            }
+                        }
+                    },
+
+                    "Install-MongoDB" : {
+                        "packages" : {
+                            "yum" : {
+                                "mdadm" : [],
+                                "sysstat" : []
+                            }
+                        },
+                        "files" : {
+                            "/etc/yum.repos.d/mongodb-org-3.0.repo" : {
+                                "content" : { "Fn::Join" : ["", [
+                                    "[mongodb-org-3.0]\n",
+                                    "name=MongoDB Repository\n",
+                                    "baseurl=https://repo.mongodb.org/yum/amazon/2013.03/mongodb-org/3.0/x86_64/\n",
+                                    "gpgcheck=0\n",
+                                    "enabled=1\n"
+                                ] ] },
+                                "mode" : "000644",
+                                "owner" : "root",
+                                "group" : "root"
+                            },
+                            "/etc/mongod.conf" : {
+                                "content" : { "Fn::Join" : ["", [
+                                    "net:\n",
+                                    "  bindIp: 0.0.0.0\n", 
+                                    "  port: 27017\n", 
+                                    "  http:\n",
+                                    "    enabled: true\n",
+                                    "    RESTInterfaceEnabled: true\n\n",
+
+                                    "systemLog:\n",
+                                    "  destination: file\n",
+                                    "  path: /var/log/mongodb/mongod.log\n",
+                                    "  logAppend: true\n\n",
+
+                                    "storage:\n",
+                                    "  dbPath: /var/lib/mongo\n",
+                                    "  journal:\n",
+                                    "    enabled: true\n\n",
+
+                                    "processManagement:\n",
+                                    "  fork: true\n",
+                                    "  pidFilePath: /var/run/mongodb/mongod.pid\n\n",
+
+                                    "sharding:\n",
+                                    "  clusterRole: configsvr\n"
+                                ] ] },
+                                "mode" : "000644",
+                                "owner" : "root",
+                                "group" : "root"
+                            }
+                        },
+                        "commands" : {
+                            "01_YumUpdateMongo" : {
+                                "command" : "yum update -y\n"
+                            },
+                            "02_InstallMongoDBServerAndClient" : {
+                                "command" : "yum install -y mongodb-org-server mongodb-org-shell > /tmp/yum-mongo.log 2>&1\n"
+                            }
+                        },
+                        "services" : {
+                            "sysvinit" : {
+                                "mongod" : { "enabled" : "true", "ensureRunning" : "true" }
+                            }
+                        }
+                    },
+
+                    "Update-Route53" : {
+                        "files" : {
+                            "/usr/local/bin/cli53" : {
+                                "source" : "https://github.com/barnybug/cli53/releases/download/0.6.3/cli53-linux-amd64",
+                                "mode" : "000755",
+                                "owner" : "root",
+                                "group" : "root"
+                            },
+                            "/tmp/update_route53.sh" : {
+                                "content" : { "Fn::Join" : ["", [
+                                    "#!/bin/bash\n\n",
+                                    "PRIVATE_IP=`curl http://169.254.169.254/latest/meta-data/local-ipv4/`\n",
+                                    "UPDATE_ROUTE_53=",  {"Ref": "UpdateRoute53" }, "\n",
+                                    "if [ $UPDATE_ROUTE_53 == 'True' ] ; then \n",
+                                    "  /usr/local/bin/cli53 rrcreate ",  {"Ref": "Route53HostedZone" }, 
+                                    " \"mongo-cfg", { "Ref" : "ConfigServerNumber" }, " 300 A $PRIVATE_IP\" --replace ; \n",
+                                    "fi\n",
+                                    "echo Route53 Update Finished!"
+                                ] ] },
+                                "mode" : "000755",
+                                "owner" : "root",
+                                "group" : "root"
+                            }
+                        },
+                        "commands" : {
+                            "01_UpdateRoute53" : {
+                                "command" : { "Fn::Join" : ["", [
+                                    "/tmp/update_route53.sh > /tmp/update_route53.log 2>&1"
+                                ]]}
+                            }
+                        }
+                    }
+
+                }
+            },
+            "Properties": {
+                "ImageId": {
+                    "Fn::FindInMap": [
+                        "AWSRegionArch2AMI", 
+                        { "Ref": "AWS::Region" },
+                        { "Fn::FindInMap": [ 
+                            "AWSInstanceType2Arch",
+                            { "Ref": "InstanceType" },
+                            "Arch"
+                        ]}
+                    ]
+                },
+                "InstanceType": {
+                    "Ref": "InstanceType"
+                },
+                "SecurityGroupIds": [
+                    {
+                        "Ref" : "MongoConfigGroupId"
+                    }
+                ],
+                "KeyName": {
+                    "Ref": "KeyName"
+                },
+                "SubnetId": {
+                    "Ref": "MongoConfigSubnetId"
+                },
+                "IamInstanceProfile": "MonitorRole",
+                "Monitoring" : "true",
+                "Tags": [
+                    {
+                        "Key": "Stack",
+                        "Value": "Production"
+                    },
+                    {
+                        "Key": "Name",
+                        "Value": { "Fn::Join" : ["", [ 
+                            "Mongo-cfg", { "Ref" : "ConfigServerNumber" }
+                        ]]}
+                    }
+                ],
+                "UserData": { "Fn::Base64" : { "Fn::Join" : ["", [
+
+                    "#!/bin/bash\n",
+                    "yum update -y aws-cfn-bootstrap\n",
+
+                    "## Error reporting helper function\n",
+                    "function error_exit\n",
+                    "{\n",
+                    "   /opt/aws/bin/cfn-signal --exit-code 1 --reason \"$1\" '", { "Ref" : "WaitHandleConfigServer" }, "'\n",
+                    "   exit 1\n",
+                    "}\n",
+
+                    "## Initialize CloudFormati\n",
+                    "/opt/aws/bin/cfn-init -v ",
+                    "         --stack ", { "Ref" : "AWS::StackName" },
+                    "         --resource MongoDbConfigServer ",
+                    "         --configsets Install ",
+                    "         --access-key ",  { "Ref" : "AccessKeyId" },
+                    "         --secret-key ", {"Ref": "SecretAccessKey" },
+                    "         --region ", { "Ref" : "AWS::Region" }, 
+                    "     > /tmp/cfn-init.log 2>&1 || error_exit $(</tmp/cfn-init.log)\n",
+
+                    "## CloudFormation signal that setup is complete\n",
+                    "/opt/aws/bin/cfn-signal --exit-code 0 --reason \"MongoDB Config Server instance setup complete\" '", { "Ref" : "WaitHandleConfigServer" }, "'\n"
+
+                ]]}}
+            }
+
+        },
+
+        "WaitHandleConfigServer" : {
+            "Type" : "AWS::CloudFormation::WaitConditionHandle",
+            "Properties" : {}
+        },
+
+        "WaitConditionConfigServer" : {
+            "Type" : "AWS::CloudFormation::WaitCondition",
+            "DependsOn" : "MongoDbConfigServer",
+            "Properties" : {
+                "Handle" : { "Ref" : "WaitHandleConfigServer" },
+                "Timeout" : "600"
+            }
+        }
+
+    }
+
+}

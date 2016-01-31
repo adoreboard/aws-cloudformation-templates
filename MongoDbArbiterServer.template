@@ -1,0 +1,372 @@
+{
+    "AWSTemplateFormatVersion": "2010-09-09",
+
+    "Description": "MongoDB Arbiter Server (Amazon Linux)",
+    
+    "Parameters": {
+    
+        "KeyName": {
+            "Description": "The name of an existing key pair to enable SSH access to Amazon EC2 instances",
+            "Type": "String",
+            "Default": ""
+        },
+    
+        "InstanceType": {
+            "Description": "MongoDB Node Type (EC2 Instance)",
+            "Type": "String",
+            "Default": "t2.micro",
+            "AllowedValues": [
+                "t2.micro",
+                "t2.small",
+                "t2.medium"
+            ],
+            "ConstraintDescription": "Must be a valid Amazon EC2 instance type."
+        },
+
+        "AccessKeyId" : {
+            "Description" : "Access Key ID",
+            "Type" : "String",
+            "Default" : ""
+        },
+
+        "SecretAccessKey" : {
+            "Description" : "Secret Access Key for the specified Access Key ID",
+            "Type" : "String",
+            "Default" : ""
+        },
+
+        "ReplicaSetName" : {
+            "Description" : "Name of the MongoDB replica set e.g. s1r (shard 1 replica)",
+            "Type" : "String",
+            "Default" : "s1r"
+        },
+    
+        "MongoArbiterVpcId": {
+            "Description": "The VPC of the MongoDB Arbiter Server",
+            "Type" : "AWS::EC2::VPC::Id",
+            "Default": ""
+        },
+    
+        "MongoArbiterSubnetId": {
+            "Description": "The subnet of the MongoDB Arbiter Server",
+            "Type" : "AWS::EC2::Subnet::Id",            
+            "Default": ""
+        },
+    
+        "MongoArbiterGroupId": {
+            "Description": "The security group for the MongoDB Arbiter Server",
+            "Type": "AWS::EC2::SecurityGroup::Id",
+            "Default": ""
+        },
+
+        "UpdateRoute53": {
+            "Description": "Add record set to AWS Route53 service.  Note: don't select this option if you want to update the Route53 table separately",
+            "Type": "String",
+            "Default": "True",
+            "AllowedValues": [ "True", "False" ]
+        },
+
+        "Route53HostedZone": {
+            "Description": "Route 53 hosted zone for updating internal DNS (Only applicable if the parameter [ UpdateRoute53 ] = \"true\"",
+            "Type": "AWS::Route53::HostedZone::Id",
+            "Default": ""
+        },
+
+        "InitMongoReplicaSet" : {
+            "Description": "Initilise the Replica-Set. This assumes that the 2 replica data nodes already exist. If the 'ReplicaSetName' = 's1r' this will expect 2 replica instances to exist and the internal DNS (via Route53) configed as `mongo-s1r1.<Route53HostedZone name>`, `mongo-s1r2.<Route53HostedZone name>` and `mongo-s1r-arb.<Route53HostedZone name>` (i.e. this server) ",
+            "Type": "String",
+            "Default": "True",
+            "AllowedValues": [ "True", "False" ]
+        }
+    
+    },
+    
+    "Mappings": {
+        "AWSInstanceType2Arch": {
+            "t2.micro"  : { "Arch": "64HVM" },
+            "t2.small"  : { "Arch": "64" },
+            "t2.medium" : { "Arch": "64" }
+        },
+        "AWSRegionArch2AMI": {
+            "eu-west-1" : { "64" : "ami-2918e35e", "64HVM" : "ami-4b18e33c" },
+            "us-east-1" : { "64" : "ami-fb8e9292", "64HVM" : "ami-978d91fe" },
+            "us-west-1" : { "64" : "ami-7aba833f", "64HVM" : "ami-5aba831f" }
+        }
+    },
+    
+    "Resources": {
+
+        "MongoDbArbiterServer": {
+            "Type": "AWS::EC2::Instance",
+            "Metadata": {
+                "AWS::CloudFormation::Init": {
+
+                    "Comment1" : "This creates an instance (generally a micro) and installs a MongoDB arbiter server",
+
+                    "configSets" : {
+                        "Install" : [ "Update-Route53", "Metric-Uploading-Config", "Install-MongoDB", "Init-MongoDB-RepliaSet" ]
+                    },
+
+                    "Update-Route53" : {
+                        "files" : {
+                            "/usr/local/bin/cli53" : {
+                                "source" : "https://github.com/barnybug/cli53/releases/download/0.6.3/cli53-linux-amd64",
+                                "mode" : "000755",
+                                "owner" : "root",
+                                "group" : "root"
+                            },
+                            "/tmp/update_route53.sh" : {
+                                "content" : { "Fn::Join" : ["", [
+                                    "#!/bin/bash\n\n",
+                                    "PRIVATE_IP=`curl http://169.254.169.254/latest/meta-data/local-ipv4/`\n",
+                                    "UPDATE_ROUTE_53=",  {"Ref": "UpdateRoute53" }, "\n",
+                                    "if [ $UPDATE_ROUTE_53 == 'True' ] ; then \n",
+                                    "  /usr/local/bin/cli53 rrcreate ",  {"Ref": "Route53HostedZone" }, 
+                                    " \"mongo-", { "Ref" : "ReplicaSetName" }, "-arb 300 A $PRIVATE_IP\" --replace --wait ; \n",
+                                    "fi\n",
+                                    "echo Route53 Update Finished!"
+                                ] ] },
+                                "mode" : "000755",
+                                "owner" : "root",
+                                "group" : "root"
+                            }
+                        },
+                        "commands" : {
+                            "01_UpdateRoute53" : {
+                                "command" : "/tmp/update_route53.sh > /tmp/update_route53.log 2>&1"
+                            }
+                        }
+                    },                    
+
+                    "Metric-Uploading-Config" : {
+                        "packages" : {
+                            "yum" : {
+                                "perl-Sys-Syslog" : [],
+                                "perl-Switch" : [],
+                                "perl-URI" : [],
+                                "perl-IO-Compress" : [],
+                                "perl-Bundle-LWP" : []
+                            }
+                        },
+                        "sources" : {
+                            "/home/ec2-user" : "http://ec2-downloads.s3.amazonaws.com/cloudwatch-samples/CloudWatchMonitoringScripts-v1.1.0.zip"
+                        },
+                        "files" : {
+                            "/home/ec2-user/crontab": {
+                                "content" : { "Fn::Join" : ["", [
+                                    "*/1 * * * * ~/aws-scripts-mon/mon-put-instance-data.pl --aws-iam-role=MonitorRole --mem-used --memory-units=megabytes --mem-util --disk-space-util --disk-space-used --disk-space-avail --disk-path=/","\n"
+                                ]]},
+                                "mode" : "000600",
+                                "owner" : "ec2-user",
+                                "group" : "ec2-user"
+                            } 
+                        },
+                        "commands" : {
+                            "01_YumUpdateMonitoring" : {
+                                "command" : "yum update -y"
+                            },
+                            "02_MonitoringCron" : {
+                                "command" : "chmod +x /home/ec2-user/aws-scripts-mon/*.pl && crontab -u ec2-user /home/ec2-user/crontab && rm /home/ec2-user/crontab"
+                            }
+                        }
+                    },
+
+                    "Install-MongoDB" : {
+                        "packages" : {
+                            "yum" : {
+                                "mdadm" : [],
+                                "sysstat" : []
+                            }
+                        },
+                        "files" : {
+                            "/etc/yum.repos.d/mongodb-org-3.0.repo" : {
+                                "content" : { "Fn::Join" : ["", [
+                                    "[mongodb-org-3.0]\n",
+                                    "name=MongoDB Repository\n",
+                                    "baseurl=https://repo.mongodb.org/yum/amazon/2013.03/mongodb-org/3.0/x86_64/\n",
+                                    "gpgcheck=0\n",
+                                    "enabled=1\n"
+                                ] ] },
+                                "mode" : "000644",
+                                "owner" : "root",
+                                "group" : "root"
+                            },
+                            "/etc/mongod.conf" : {
+                                "content" : { "Fn::Join" : ["", [
+                                    "net:\n",
+                                    "  bindIp: 0.0.0.0\n", 
+                                    "  port: 27017\n", 
+                                    "  http:\n",
+                                    "    enabled: true\n",
+                                    "    RESTInterfaceEnabled: true\n\n",
+
+                                    "systemLog:\n",
+                                    "  destination: file\n",
+                                    "  path: /var/log/mongodb/mongod.log\n",
+                                    "  logAppend: true\n\n",
+
+                                    "storage:\n",
+                                    "  dbPath: /var/lib/mongo\n",
+                                    "  journal:\n",
+                                    "    enabled: false\n",
+                                    "  mmapv1:\n",
+                                    "    smallFiles: true\n\n",
+
+                                    "processManagement:\n",
+                                    "  fork: true\n",
+                                    "  pidFilePath: /var/run/mongodb/mongod.pid\n\n",
+
+                                    "replication:\n",
+                                    "  replSetName: ", { "Ref" : "ReplicaSetName" }, "\n\n", 
+
+                                    "sharding:\n",
+                                    "  clusterRole: shardsvr\n"
+                                ] ] },
+                                "mode" : "000644",
+                                "owner" : "root",
+                                "group" : "root"
+                            }
+                        },
+                        "commands" : {
+                            "01_YumUpdateMongo" : {
+                                "command" : "yum update -y\n"
+                            },
+                            "02_InstallMongoDBServerAndClient" : {
+                                "command" : "yum install -y mongodb-org-server mongodb-org-shell > /tmp/yum-mongo.log 2>&1\n"
+                            }
+                        },
+                        "services" : {
+                            "sysvinit" : {
+                                "mongod" : { "enabled" : "true", "ensureRunning" : "true" }
+                            }
+                        }
+                    },
+
+                    "Init-MongoDB-RepliaSet" : {
+                        "files" : {
+                            "/tmp/init_mongo_replicaset.sh" : {
+                                "content" : { "Fn::Join" : ["", [
+                                    "#!/bin/bash\n\n",
+                                    "# This script automates the initialisation of a MongoDB replica-set - see https://docs.mongodb.org/manual/reference/method/rs.initiate\n",
+                                    "# Assumes that the 2 main replica data nodes and internal DNS is configured properly.\n\n",
+                                    "INIT_MONGO_REPLICA_SET=",  {"Ref": "InitMongoReplicaSet" }, "\n",
+                                    "ZONE_NAME=`aws route53 get-hosted-zone --id ", {"Ref": "Route53HostedZone" }, " | jp 'HostedZone.Name' | sed 's/\"//g' | sed 's/\\.$//'`\n",
+                                    "REPLICA_SET=",  {"Ref": "ReplicaSetName" }, "\n\n",
+                                    "if [ $INIT_MONGO_REPLICA_SET == 'True' ] ; then \n",
+                                    "cat << END > /tmp/init_mongo_replicaset.js\n",
+                                    "var cfg = { \n",
+                                    "    _id : \"${REPLICA_SET}\",\n",
+                                    "    members : [\n",
+                                    "        {_id : 0, host : \"mongo-${REPLICA_SET}1.$ZONE_NAME:27017\"},\n",
+                                    "        {_id : 1, host : \"mongo-${REPLICA_SET}2.$ZONE_NAME:27017\"},\n",
+                                    "        {_id : 2, host : \"mongo-${REPLICA_SET}-arb.$ZONE_NAME:27017\", arbiterOnly: true},\n",
+                                    "    ]\n",
+                                    "}\n",
+                                    "var error = rs.initiate(cfg)\n",
+                                    "printjson(error);\n",
+                                    "END\n\n",
+                                    "mongo mongo-${REPLICA_SET}1.$ZONE_NAME:27017/admin /tmp/init_mongo_replicaset.js\n\n",
+                                    "fi\n",
+                                    "echo MongoDB ReplicaSet initialisation script finished!\n"
+                                ] ] },
+                                "mode" : "000755",
+                                "owner" : "root",
+                                "group" : "root"
+                            }
+                        },
+                        "commands" : {
+                            "01_init_mongo_replica" : {
+                                "command" : "/tmp/init_mongo_replicaset.sh > /tmp/init_mongo_replicaset.log 2>&1"
+                            }
+                        }
+
+                    }
+
+                }
+            },
+            "Properties": {
+                "ImageId": {
+                    "Fn::FindInMap": [
+                        "AWSRegionArch2AMI", 
+                        { "Ref": "AWS::Region" },
+                        { "Fn::FindInMap": [ 
+                            "AWSInstanceType2Arch",
+                            { "Ref": "InstanceType" },
+                            "Arch"
+                        ]}
+                    ]
+                },
+                "InstanceType": {
+                    "Ref": "InstanceType"
+                },
+                "SecurityGroupIds": [
+                    {
+                        "Ref" : "MongoArbiterGroupId"
+                    }
+                ],
+                "KeyName": {
+                    "Ref": "KeyName"
+                },
+                "SubnetId": {
+                    "Ref": "MongoArbiterSubnetId"
+                },
+                "IamInstanceProfile": "MonitorRole",
+                "Monitoring" : "true",
+                "Tags": [
+                    {
+                        "Key": "Stack",
+                        "Value": "Production"
+                    },
+                    {
+                        "Key": "Name",
+                        "Value": { "Fn::Join" : ["", [ 
+                            "Mongo-", { "Ref" : "ReplicaSetName" }, "-arb"
+                        ]]}
+                    }
+                ],
+                "UserData": { "Fn::Base64" : { "Fn::Join" : ["", [
+                    "#!/bin/bash\n",
+                    "yum update -y aws-cfn-bootstrap\n",
+
+                    "## Error reporting helper function\n",
+                    "function error_exit\n",
+                    "{\n",
+                    "   /opt/aws/bin/cfn-signal --exit-code 1 --reason \"$1\" '", { "Ref" : "WaitHandleArbiterServer" }, "'\n",
+                    "   exit 1\n",
+                    "}\n",
+
+                    "## Initialize CloudFormati\n",
+                    "/opt/aws/bin/cfn-init -v ",
+                    "         --stack ", { "Ref" : "AWS::StackName" },
+                    "         --resource MongoDbArbiterServer ",
+                    "         --configsets Install ",
+                    "         --access-key ",  { "Ref" : "AccessKeyId" },
+                    "         --secret-key ", {"Ref": "SecretAccessKey" },
+                    "         --region ", { "Ref" : "AWS::Region" }, 
+                    "     > /tmp/cfn-init.log 2>&1 || error_exit $(</tmp/cfn-init.log)\n",
+
+                    "## CloudFormation signal that setup is complete\n",
+                    "/opt/aws/bin/cfn-signal --exit-code 0 --reason \"MongoDB Config Server instance setup complete\" '", { "Ref" : "WaitHandleArbiterServer" }, "'\n"
+
+                ]]}}
+            }
+
+        },
+
+        "WaitHandleArbiterServer" : {
+            "Type" : "AWS::CloudFormation::WaitConditionHandle",
+            "Properties" : {}
+        },
+
+        "WaitConditionArbiterServer" : {
+            "Type" : "AWS::CloudFormation::WaitCondition",
+            "DependsOn" : "MongoDbArbiterServer",
+            "Properties" : {
+                "Handle" : { "Ref" : "WaitHandleArbiterServer" },
+                "Timeout" : "900"
+            }
+        }
+
+    }
+
+}
